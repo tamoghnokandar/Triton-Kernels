@@ -1,64 +1,65 @@
-import torch
-
 import triton
 import triton.language as tl
 
-try:
-    # This is https://github.com/NVIDIA/apex, NOT the apex on PyPi, so it
-    # should not be added to extras_require in setup.py.
-    import apex
-    HAS_APEX = True
-except ModuleNotFoundError:
-    HAS_APEX = False
-
-DEVICE = triton.runtime.driver.active.get_active_torch_device()
-
-
+# Note: X, gamma, beta, Y are all float32 device tensors
+@triton.autotune(
+    configs=[
+        # Add larger block sizes and more warps for large N
+        triton.Config({'BLOCK_SIZE': 1024, 'num_warps': 4}),
+        triton.Config({'BLOCK_SIZE': 2048, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE': 4096, 'num_warps': 8}),
+        triton.Config({'BLOCK_SIZE': 8192, 'num_warps': 16}),
+        triton.Config({'BLOCK_SIZE': 16384, 'num_warps': 16}),
+    ],
+    key=['N'],
+)
 @triton.jit
-def _layer_norm_fwd_fused(
-    X,  # pointer to the input
-    Y,  # pointer to the output
-    W,  # pointer to the weights
-    B,  # pointer to the biases
-    Mean,  # pointer to the mean
-    Rstd,  # pointer to the 1/std
-    stride,  # how much to increase the pointer when moving by 1 row
-    N,  # number of columns in X
-    eps,  # epsilon to avoid division by zero
-    BLOCK_SIZE: tl.constexpr,
-):
-    # Map the program id to the row of X and Y it should compute.
-    row = tl.program_id(0)
-    Y += row * stride
-    X += row * stride
-    # Compute mean
-    mean = 0
-    _mean = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        a = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
-        _mean += a
-    mean = tl.sum(_mean, axis=0) / N
-    # Compute variance
-    _var = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        x = tl.load(X + cols, mask=cols < N, other=0.).to(tl.float32)
-        x = tl.where(cols < N, x - mean, 0.)
-        _var += x * x
-    var = tl.sum(_var, axis=0) / N
-    rstd = 1 / tl.sqrt(var + eps)
-    # Write mean / rstd
-    tl.store(Mean + row, mean)
-    tl.store(Rstd + row, rstd)
-    # Normalize and apply linear transformation
-    for off in range(0, N, BLOCK_SIZE):
-        cols = off + tl.arange(0, BLOCK_SIZE)
-        mask = cols < N
-        w = tl.load(W + cols, mask=mask)
-        b = tl.load(B + cols, mask=mask)
-        x = tl.load(X + cols, mask=mask, other=0.).to(tl.float32)
-        x_hat = (x - mean) * rstd
-        y = x_hat * w + b
-        # Write output
-        tl.store(Y + cols, y, mask=mask)
+def layernorm_forward(X_ptr, Y_ptr, gamma_ptr, beta_ptr, stride_X, stride_Y, N, eps, BLOCK_SIZE:tl.constexpr):
+    row = tl.program_id(axis=0)
+    X_ptr += row*stride_X
+    Y_ptr += row*stride_Y
+    sum_accumulator = tl.zeros([BLOCK_SIZE],dtype=tl.float32)
+    variance_accumultor = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for offset in range(0, N, BLOCK_SIZE):
+        cols = offset + tl.arange(0, BLOCK_SIZE)
+        mask = cols<N
+        x = tl.load(X_ptr + cols, mask=mask, other=0.0)
+        sum_accumulator += x
+    mean = tl.sum(sum_accumulator, axis=0)/N
+    
+    for offset in range(0, N, BLOCK_SIZE):
+        cols = offset + tl.arange(0, BLOCK_SIZE)
+        mask = cols<N
+        x = tl.load(X_ptr + cols, mask=mask, other=0.0)
+        x_centered = tl.where(mask, x-mean, 0.0)
+        variance_accumultor += x_centered*x_centered
+    
+    variance = tl.sum(variance_accumultor, axis=0)/N
+    rstd = 1/tl.sqrt(variance+eps)
+    # tl.store(mean_ptr+row, mean)
+    # tl.store(rstd_ptr+row, rstd)
+    for offset in range(0, N, BLOCK_SIZE):
+        cols = offset + tl.arange(0, BLOCK_SIZE)
+        mask = cols<N
+        gamma = tl.load(gamma_ptr + cols, mask=mask, other=0.0)
+        beta = tl.load(beta_ptr + cols, mask=mask, other=0.0)
+        x = tl.load(X_ptr + cols, mask=mask, other=0.0)
+        x_normalized = (x-mean)*rstd
+        y = x_normalized*gamma + beta
+        tl.store(Y_ptr+cols,y,mask=mask)
+    
+    
+def solution(X, gamma, beta, Y, B: int, F: int, D1: int, D2: int):
+    MAX_FUSED_SIZE = 165536 // X.element_size()
+    N = F*D1*D2
+    # BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(N))
+    # if N > BLOCK_SIZE:
+    #     raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    # BLOCK_SIZE, num_warps = calculate_settings(N)
+    # heuristics for number of warps
+    
+    eps = 1e-5
+    layernorm_forward[(B, )](X, Y, gamma, beta, X.stride(0), Y.stride(0), N, eps)
+    return Y
+
+  
